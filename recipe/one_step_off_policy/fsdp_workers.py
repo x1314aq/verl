@@ -15,6 +15,7 @@
 
 import logging
 import os
+import datetime
 
 import torch
 import torch.distributed
@@ -26,6 +27,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_name,
+    get_nccl_backend,
     get_torch_device,
 )
 from verl.utils.fsdp_utils import (
@@ -122,13 +124,25 @@ class DetachActorWorker(DetachSync):
         if role == "actor":
             self.ps_rank_offset = kwargs.get("rank_offset", self.rank)
             self.ps_world_size = kwargs.get("ps_world_size", self.world_size)
-            self.ps = ParameterServer(rank=self.rank, world_size=self.ps_world_size)
+            self.ps = ParameterServer(rank=self.rank, world_size=self.ps_world_size, auto_pg=True)
             self.index = 0
 
-    def init_process_group(self):
-        os.environ["HCCL_NPU_SOCKET_PORT_RANGE"] = "61020"
-        self.ps.init_process_group(device_index=0, master_port=60010)
-        del os.environ["HCCL_NPU_SOCKET_PORT_RANGE"]
+    def _destory_pg(self):
+        assert torch.distributed.is_initialized(), "torch.distributed process group is not initialized"
+        torch.distributed.destroy_process_group()
+
+    def _construct_pg(self):
+        assert not torch.distributed.is_initialized(), "torch.distributed process group is initialized"
+
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        torch.distributed.init_process_group(
+            backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+            rank=rank,
+            world_size=world_size,
+            timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
+            init_method=os.environ.get("DIST_INIT_METHOD", None),
+        )
 
     def split_tensors(self) -> dict[str, torch.Tensor]:
         assert self._is_actor and not self.config.hybrid_engine
@@ -159,15 +173,19 @@ class DetachActorWorker(DetachSync):
         def req_func(socket_paths: list[tuple[str, str]]):
             return
 
-        self.init_process_group()
         named_tensors = self.split_tensors()
         checkpoint_name = f"sync_{self.index}"
+
+        # destroy process group before sync weights
+        self._destory_pg()
 
         self.ps.register_checkpoint(checkpoint_name=checkpoint_name, named_tensors=named_tensors)
         self.ps.gather_metas(checkpoint_name)
         self.ps.update(checkpoint_name, req_func, ranks=list(range(self.ps_rank_offset, self.ps_world_size)))
-
         self.index += 1
+
+        # reconstruct process group after sync weights
+        self._construct_pg()
 
     def _get_actor_params(self):
         assert self._is_actor

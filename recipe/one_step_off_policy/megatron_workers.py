@@ -15,6 +15,7 @@
 
 import logging
 import os
+import datetime
 
 import torch
 import torch.distributed
@@ -24,9 +25,10 @@ from ray.util.collective import collective
 
 from recipe.one_step_off_policy.distributed_util import vllm_stateless_init_process_group
 from verl.single_controller.base.decorator import Dispatch, register
-from verl.utils.device import get_torch_device
+from verl.utils.device import get_torch_device, get_nccl_backend
 from verl.utils.megatron_utils import load_megatron_model_to_gpu, offload_megatron_model_to_cpu
 from verl.utils.ray_utils import get_event_loop
+from verl.utils.distributed import set_numa_affinity
 from verl.workers.megatron_workers import (
     ActorRolloutRefWorker,
     AsyncActorRolloutRefWorker,
@@ -127,13 +129,24 @@ class DetachActorWorker(DetachSync):
         if role == "actor":
             self.ps_rank_offset = kwargs.get("rank_offset", self.rank)
             self.ps_world_size = kwargs.get("ps_world_size", self.world_size)
-            self.ps = ParameterServer(rank=self.rank, world_size=self.ps_world_size)
+            self.ps = ParameterServer(rank=self.rank, world_size=self.ps_world_size, auto_pg=True)
             self.index = 0
 
-    def init_process_group(self):
-        os.environ["HCCL_NPU_SOCKET_PORT_RANGE"] = "61020"
-        self.ps.init_process_group(device_index=0, master_port=60010)
-        del os.environ["HCCL_NPU_SOCKET_PORT_RANGE"]
+    def _destory_pg(self):
+        assert torch.distributed.is_initialized(), "torch.distributed process group is not initialized"
+        torch.distributed.destroy_process_group()
+
+    def _construct_pg(self):
+        assert not torch.distributed.is_initialized(), "torch.distributed process group is initialized"
+
+        set_numa_affinity()
+        rank = int(os.environ["LOCAL_RANK"])
+        torch.distributed.init_process_group(
+            backend=get_nccl_backend(),
+            timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
+            init_method=os.environ.get("DIST_INIT_METHOD", None),
+        )
+        get_torch_device().set_device(rank)
 
     def split_tensors(self) -> dict[str, torch.Tensor]:
         assert self._is_actor and not self.config.hybrid_engine
@@ -163,15 +176,17 @@ class DetachActorWorker(DetachSync):
         def req_func(socket_paths: list[tuple[str, str]]):
             return
 
-        self.init_process_group()
         named_tensors = self.split_tensors()
         checkpoint_name = f"sync_{self.index}"
+
+        self._destory_pg()
 
         self.ps.register_checkpoint(checkpoint_name=checkpoint_name, named_tensors=named_tensors)
         self.ps.gather_metas(checkpoint_name)
         self.ps.update(checkpoint_name, req_func, ranks=list(range(self.ps_rank_offset, self.ps_world_size)))
-
         self.index += 1
+
+        self._construct_pg()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def _get_actor_params_generator(self):

@@ -45,13 +45,8 @@ class CkptEngineWorker(Worker):
         self.ps_world_size = ps_world_size
         self.inference_parallel_size = inference_parallel_size
         self.rollout_name = rollout_name
-        self.ps = ParameterServer(rank=rank, world_size=ps_world_size)
+        self.ps = ParameterServer(rank=rank, world_size=ps_world_size, auto_pg=True)
         self.index = 0
-
-    def _init_process_group(self):
-        os.environ["HCCL_NPU_SOCKET_PORT_RANGE"] = "61020"
-        self.ps.init_process_group(device_index=0, master_port=60010)
-        del os.environ["HCCL_NPU_SOCKET_PORT_RANGE"]
 
     def check_vllm_ready(self, uds: str | None = None):
         if self.ps_rank != self.ps_rank // self.inference_parallel_size * self.inference_parallel_size:
@@ -132,7 +127,6 @@ class CkptEngineWorker(Worker):
         elif self.rollout_name == "vllm":
             req_func = vllm_req_func
 
-        self._init_process_group()
         checkpoint_name = f"sync_{self.index}"
         self.ps.register_checkpoint(checkpoint_name=checkpoint_name)
         self.ps.gather_metas(checkpoint_name)
